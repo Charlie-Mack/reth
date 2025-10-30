@@ -2,7 +2,9 @@
 //! The file can then be used as input for replaying benchmarks from a file.
 
 use crate::bench::{
-    artificial_payload_builder::{ArtificialPayloadBuilder, build_artificial_payload_builder}, context::{BenchContext, BlockSource}, output::BLOCK_STORAGE_OUTPUT_SUFFIX
+    artificial_block_builder::ArtificialBlockBuilder,
+    context::{BenchContext, BlockSource},
+    output::BLOCK_STORAGE_OUTPUT_SUFFIX,
 };
 use alloy_provider::{network::AnyNetwork, Provider, RootProvider};
 
@@ -66,7 +68,7 @@ pub(crate) struct BlockFileHeader {
 impl BlockFileHeader {
     fn new(is_optimism: bool, from_block: u64, to_block: u64) -> Self {
         Self {
-            version: FILE_FORMAT_VERSION, 
+            version: FILE_FORMAT_VERSION,
             block_type: if is_optimism { BlockType::Optimism } else { BlockType::Ethereum },
             from_block,
             to_block,
@@ -241,11 +243,12 @@ impl BlockFileReader {
 impl Command {
     /// Execute `benchmark block-storage` command
     pub async fn execute(self, _ctx: CliContext) -> eyre::Result<()> {
-
         if self.rpc_url.is_none() {
             let datadir = self.datadir.datadir.unwrap_or_default();
             info!("Using datadir: {}", datadir);
-            let builder = build_artificial_payload_builder(datadir)?;
+            let mut builder = ArtificialBlockBuilder::new(datadir, 23681700, 45_000_000)?;
+            builder.build_next_block()?;
+
             return Ok(());
         }
 

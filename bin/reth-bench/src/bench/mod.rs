@@ -5,8 +5,8 @@ use reth_cli_runner::CliContext;
 use reth_node_core::args::LogArgs;
 use reth_tracing::FileWorkerGuard;
 
+mod artificial_block_builder;
 mod block_storage;
-mod artificial_payload_builder;
 mod context;
 mod new_payload_fcu;
 mod new_payload_only;
