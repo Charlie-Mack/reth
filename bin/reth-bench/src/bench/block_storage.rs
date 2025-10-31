@@ -16,8 +16,13 @@ use alloy_rlp::{Decodable, Encodable};
 use clap::Parser;
 use eyre::{Context, OptionExt};
 use op_alloy_consensus::OpTxEnvelope;
+use reth_basic_payload_builder::PayloadBuilder;
+use reth_chainspec::ChainSpecBuilder;
 use reth_cli_runner::CliContext;
+use reth_ethereum_payload_builder::EthereumBuilderConfig;
 use reth_node_core::args::{BenchmarkArgs, DatadirArgs};
+use reth_node_ethereum::{EthEvmConfig, EthereumNode};
+use reth_provider::providers::ReadOnlyConfig;
 use std::{
     fs::File,
     io::{BufReader, BufWriter, Read, Write},
@@ -246,6 +251,32 @@ impl Command {
         if self.rpc_url.is_none() {
             let datadir = self.datadir.datadir.unwrap_or_default();
             info!("Using datadir: {}", datadir);
+            let spec = ChainSpecBuilder::mainnet().build();
+            let factory = EthereumNode::provider_factory_builder()
+                .open_read_only(spec.into(), ReadOnlyConfig::from_datadir(datadir))?;
+
+            let evm_config = EthEvmConfig::mainnet();
+            let builder_config = EthereumBuilderConfig::default();
+
+            let provider = factory.provider()?;
+            let state_provider = factory.latest()?;
+
+            let target_gas_limit = 45_000_000;
+            let from_block = 23696800;
+            let mut builder = ArtificialPayloadBuilder::new(
+                factory,
+                evm_config,
+                builder_config,
+                target_gas_limit,
+                from_block,
+            );
+
+            let build_args = builder.get_build_args(from_block)?;
+
+            let payload = builder.try_build(build_args)?;
+
+            info!("Built new payload for block {:?}", payload);
+
             // let mut builder = ArtificialPayloadBuilder::new(datadir, 23686410, 45_000_000)?;
 
             // builder.build_next_payload()?;

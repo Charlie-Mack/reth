@@ -14,6 +14,9 @@ workspace = true
 
 [dependencies]
 # reth
+reth-consensus-common.workspace = true
+reth-payload-primitives.workspace = true
+reth-payload-builder.workspace = true
 reth-revm.workspace = true
 reth-evm.workspace = true
 reth-ethereum-payload-builder.workspace = true

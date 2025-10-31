@@ -1,37 +1,48 @@
-use alloy_consensus::Header as AlloyHeader;
-use alloy_eips::BlockNumberOrTag;
+use alloy_consensus::{BlockHeader, Transaction};
+use alloy_eips::{BlockNumberOrTag, Typed2718};
 use alloy_primitives::{Address, B256, U256};
+use alloy_rlp::Encodable;
+use alloy_rpc_types_engine::PayloadAttributes;
 use eyre::OptionExt;
+use reth_basic_payload_builder::{
+    BuildArguments, BuildOutcome, HeaderForPayload, MissingPayloadBehaviour, PayloadBuilder,
+    PayloadConfig,
+};
 use reth_chainspec::{ChainSpecBuilder, EthChainSpec, EthereumHardforks};
+use reth_consensus_common::validation::MAX_RLP_BLOCK_SIZE;
 use reth_db::{
     mdbx::{tx::Tx, RO},
     DatabaseEnv,
 };
-use reth_ethereum_engine_primitives::{BlobSidecars, EthBuiltPayload};
 use reth_ethereum_payload_builder::EthereumBuilderConfig;
-use reth_ethereum_primitives::EthPrimitives;
+use reth_ethereum_primitives::{EthPrimitives, TransactionSigned};
 use reth_evm::{
-    execute::{BlockBuilder, BlockBuilderOutcome},
+    block::{BlockExecutionError, BlockValidationError},
+    execute::{BlockBuilder, BlockBuilderOutcome, ExecutorTx},
     ConfigureEvm, NextBlockEnvAttributes,
 };
-use reth_node_api::NodeTypesWithDBAdapter;
+use reth_node_api::{NodeTypesWithDBAdapter, PayloadBuilderError};
 use reth_node_core::dirs::{DataDirPath, PlatformPath};
 use reth_node_ethereum::{EthEvmConfig, EthereumNode};
+use reth_payload_builder::{BlobSidecars, EthBuiltPayload, EthPayloadBuilderAttributes};
+use reth_payload_primitives::PayloadBuilderAttributes;
+use reth_primitives_traits::SignedTransaction;
 use reth_provider::{
     providers::ReadOnlyConfig, BlockBodyIndicesProvider, BlockReader, ChainSpecProvider,
     DatabaseProvider, HeaderProvider, ProviderFactory, StateProviderFactory, TransactionsProvider,
 };
-use reth_revm::{database::StateProviderDatabase, db::State};
+use reth_revm::{
+    cached::CachedReads, cancelled::CancelOnDrop, database::StateProviderDatabase, db::State,
+};
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::{debug, info, trace, warn};
 
 type BenchDbProvider =
     DatabaseProvider<Tx<RO>, NodeTypesWithDBAdapter<EthereumNode, Arc<DatabaseEnv>>>;
 
-type BenchProviderFactory = ProviderFactory<NodeTypesWithDBAdapter<EthereumNode, Arc<DatabaseEnv>>>;
-
-pub struct ArtificialPayloadBuilder {
-    client: Client,
+#[derive(Debug, Clone)]
+pub struct ArtificialPayloadBuilder<EvmConfig = EthEvmConfig> {
+    factory: ProviderFactory<NodeTypesWithDBAdapter<EthereumNode, Arc<DatabaseEnv>>>,
     evm_config: EvmConfig,
     target_gas_limit: u64,
     builder_config: EthereumBuilderConfig,
@@ -39,21 +50,50 @@ pub struct ArtificialPayloadBuilder {
     next_tx_num: u64,
 }
 
-impl<Client, EvmConfig> ArtificialPayloadBuilder<Client, EvmConfig> {
-    pub fn new(client: Client, evm_config: EvmConfig, builder_config: EthereumBuilderConfig, target_gas_limit: u64, from_block: u64) -> Self {
-        Self { client, evm_config, builder_config, target_gas_limit, next_tx_num: 0 }
-    }   
+impl<EvmConfig> ArtificialPayloadBuilder<EvmConfig> {
+    pub fn new(
+        factory: ProviderFactory<NodeTypesWithDBAdapter<EthereumNode, Arc<DatabaseEnv>>>,
+        evm_config: EvmConfig,
+        builder_config: EthereumBuilderConfig,
+        target_gas_limit: u64,
+        from_block: u64,
+    ) -> Self {
+        Self { factory, evm_config, builder_config, target_gas_limit, next_tx_num: 0 }
+    }
+
+    pub fn get_build_args(
+        &self,
+        from_block: u64,
+    ) -> Result<BuildArguments<EthPayloadBuilderAttributes, EthBuiltPayload>, PayloadBuilderError>
+    {
+        let provider = self.factory.provider()?;
+
+        let parent_header = provider
+            .sealed_header(from_block)
+            .map_err(PayloadBuilderError::other)?
+            .unwrap_or_default();
+
+        let attributes = EthPayloadBuilderAttributes::new(
+            parent_header.hash(),
+            PayloadAttributes {
+                timestamp: parent_header.timestamp + 12,
+                prev_randao: parent_header.mix_hash,
+                suggested_fee_recipient: Address::ZERO,
+                withdrawals: None,
+                parent_beacon_block_root: parent_header.parent_beacon_block_root,
+            },
+        );
+
+        let config = PayloadConfig::new(Arc::new(parent_header), attributes);
+        let args =
+            BuildArguments::new(CachedReads::default(), config, CancelOnDrop::default(), None);
+        Ok(args)
+    }
 }
 
-impl<Client, EvmConfig> PayloadBuilder for ArtificialPayloadBuilder<Client, EvmConfig>
+impl<EvmConfig> PayloadBuilder for ArtificialPayloadBuilder<EvmConfig>
 where
     EvmConfig: ConfigureEvm<Primitives = EthPrimitives, NextBlockEnvCtx = NextBlockEnvAttributes>,
-    Client: StateProviderFactory
-        + ChainSpecProvider<ChainSpec: EthereumHardforks>
-        + BlockReader
-        + TransactionsProvider
-        + HeaderProvider<Header = AlloyHeader>
-        + Clone,
 {
     type Attributes = EthPayloadBuilderAttributes;
     type BuiltPayload = EthBuiltPayload;
@@ -62,10 +102,12 @@ where
         &self,
         args: BuildArguments<EthPayloadBuilderAttributes, EthBuiltPayload>,
     ) -> Result<BuildOutcome<EthBuiltPayload>, PayloadBuilderError> {
-        let BuildArguments { mut cached_reads, config, cancel, best_payload } = args;
-        let PayloadConfig { parent_header, attributes } = config;
-
-        self.build_next_artificial_block()
+        build_artificial_payload(
+            self.factory.clone(),
+            self.evm_config.clone(),
+            self.builder_config.clone(),
+            args,
+        )
     }
 
     fn on_missing_payload(
@@ -84,104 +126,172 @@ where
         // But you could build a minimal block with no transactions
         Err(PayloadBuilderError::MissingPayload)
     }
+}
 
+pub fn build_artificial_payload<EvmConfig>(
+    factory: ProviderFactory<NodeTypesWithDBAdapter<EthereumNode, Arc<DatabaseEnv>>>,
+    evm_config: EvmConfig,
+    builder_config: EthereumBuilderConfig,
+    args: BuildArguments<EthPayloadBuilderAttributes, EthBuiltPayload>,
+) -> Result<BuildOutcome<EthBuiltPayload>, PayloadBuilderError>
+where
+    EvmConfig: ConfigureEvm<Primitives = EthPrimitives, NextBlockEnvCtx = NextBlockEnvAttributes>,
+{
+    let BuildArguments { mut cached_reads, config, cancel, best_payload } = args;
+    let PayloadConfig { parent_header, attributes } = config;
 
-    /// Build the next artificial block and return it as an EthBuiltPayload
-    fn build_next_artificial_block(&mut self) -> eyre::Result<EthBuiltPayload> {
-        let parent_block_number = self.build_from;
+    // Get a provider from the factory for this operation
+    let client = factory.provider()?;
+    let state_provider = factory.history_by_block_hash(parent_header.hash())?;
 
-        // Get a provider from the factory for this operation
-        let provider = self.factory.provider()?;
-        let state_provider = self.factory.history_by_block_number(parent_block_number)?;
+    let state = StateProviderDatabase::new(&state_provider);
+    let mut db = State::builder().with_database(state).with_bundle_update().build();
 
-        let state = StateProviderDatabase::new(&state_provider);
-        let mut db = State::builder().with_database(state).with_bundle_update().build();
+    let mut builder = evm_config
+        .builder_for_next_block(
+            &mut db,
+            &parent_header,
+            NextBlockEnvAttributes {
+                timestamp: attributes.timestamp(),
+                suggested_fee_recipient: attributes.suggested_fee_recipient(),
+                prev_randao: attributes.prev_randao(),
+                gas_limit: builder_config.desired_gas_limit,
+                parent_beacon_block_root: attributes.parent_beacon_block_root(),
+                withdrawals: Some(attributes.withdrawals().clone()),
+            },
+        )
+        .map_err(PayloadBuilderError::other)?;
 
-        let parent_header =
-            provider.sealed_header(parent_block_number)?.ok_or_eyre("Parent header not found")?;
+    let chain_spec = client.chain_spec();
 
-        // Simple attributes for benchmarking
-        let next_block_attrs = NextBlockEnvAttributes {
-            timestamp: parent_header.timestamp + 12,
-            suggested_fee_recipient: Address::ZERO,
-            prev_randao: parent_header.mix_hash,
-            gas_limit: self.target_gas_limit,
-            parent_beacon_block_root: parent_header.parent_beacon_block_root,
-            withdrawals: None,
-        };
+    // Get transaction indices from parent block
+    let indices =
+        client.block_body_indices(parent_header.number).map_err(PayloadBuilderError::other)?;
+    let mut start_tx_num = indices.map(|indices| indices.last_tx_num() + 1).unwrap_or(0);
 
-        let mut builder =
-            self.evm_config.builder_for_next_block(&mut db, &parent_header, next_block_attrs)?;
+    info!(
+        target: "artificial_payload_builder",
+        parent_number = parent_header.number,
+        start_tx_num = start_tx_num,
+        "Building artificial block"
+    );
 
-        let chain_spec = self.factory.chain_spec();
+    // TODO: Fetch and execute transactions from the database starting at start_tx_num
+    // Loop until you hit target_gas_limit or run out of transactions
+    let mut cumulative_gas_used = 0;
+    let mut total_fees = U256::ZERO;
 
-        builder.apply_pre_execution_changes()?;
+    builder.apply_pre_execution_changes().map_err(|err| {
+        warn!(target: "payload_builder", %err, "failed to apply pre-execution changes");
+        PayloadBuilderError::Internal(err.into())
+    })?;
 
-        // Get transaction indices from parent block
-        let indices = provider.block_body_indices(parent_block_number)?.ok_or_eyre("No indices")?;
-        let start_tx_num = indices.last_tx_num() + 1;
+    // initialize empty blob sidecars at first. If cancun is active then this will be populated by
+    // blob sidecars if any.
+    let mut blob_sidecars = BlobSidecars::Empty;
 
-        info!(
-            target: "artificial_payload_builder",
-            parent_number = parent_block_number,
-            start_tx_num = start_tx_num,
-            "Building artificial block"
-        );
+    let mut block_blob_count = 0;
+    let mut block_transactions_rlp_length = 0;
 
-        // TODO: Fetch and execute transactions from the database starting at start_tx_num
-        // Loop until you hit target_gas_limit or run out of transactions
-        let mut cumulative_gas_used = 0;
-        let mut total_fees = U256::ZERO;
+    let blob_params = chain_spec.blob_params_at_timestamp(attributes.timestamp);
+    let max_blob_count =
+        blob_params.as_ref().map(|params| params.max_blob_count).unwrap_or_default();
 
-        builder.apply_pre_execution_changes().map_err(|err| {
-            warn!(target: "payload_builder", %err, "failed to apply pre-execution changes");
-            PayloadBuilderError::Internal(err.into())
-        })?;
+    let is_osaka = chain_spec.is_osaka_active_at_timestamp(attributes.timestamp);
 
-        // Example transaction execution loop (you'll need to implement this):
-        // let mut tx_num = start_tx_num;
-        // while cumulative_gas_used < self.target_gas_limit {
-        //     let tx = provider.transaction_by_id(tx_num)?
-        //         .ok_or_eyre("Transaction not found")?;
-        //
-        //     match builder.execute_transaction(tx.clone()) {
-        //         Ok(gas_used) => {
-        //             cumulative_gas_used += gas_used;
-        //             let base_fee = builder.evm_mut().block().basefee();
-        //             let miner_fee = tx.effective_tip_per_gas(base_fee)
-        //                 .expect("fee is always valid");
-        //             total_fees += U256::from(miner_fee) * U256::from(gas_used);
-        //             tx_num += 1;
-        //         }
-        //         Err(e) => {
-        //             // Skip invalid transactions
-        //             tx_num += 1;
-        //             continue;
-        //         }
-        //     }
-        // }
+    'tx_fetch: while cumulative_gas_used < builder_config.desired_gas_limit {
+        let tx_range = start_tx_num..start_tx_num + 100;
 
-        todo!()
+        let txs = client.transactions_by_tx_range(tx_range).map_err(PayloadBuilderError::other)?;
 
-        // // Finish building
-        // let BlockBuilderOutcome { execution_result, block, .. } =
-        //     builder.finish(&state_provider)?;
-        // let sealed_block = Arc::new(block.sealed_block().clone());
+        for tx in txs {
+            let recovered_tx = tx.try_into_recovered().unwrap();
 
-        // let requests = chain_spec
-        //     .is_prague_active_at_timestamp(next_block_attrs.timestamp)
-        //     .then_some(execution_result.requests);
+            if recovered_tx.gas_limit() > builder_config.desired_gas_limit - cumulative_gas_used {
+                trace!(target: "payload_builder", tx=?recovered_tx.hash(), builder_config.desired_gas_limit, cumulative_gas_used, "gas limit exceeded, completing block");
+                break 'tx_fetch;
+            }
 
-        // // Increment for next call
-        // self.build_from += 1;
+            let gas_used = match builder.execute_transaction(recovered_tx.clone()) {
+                Ok(gas_used) => gas_used,
+                Err(BlockExecutionError::Validation(BlockValidationError::InvalidTx {
+                    error,
+                    ..
+                })) => {
+                    if error.is_nonce_too_low() {
+                        // if the nonce is too low, we can skip this transaction
+                        trace!(target: "payload_builder", %error, tx=?recovered_tx.hash(), "skipping nonce too low transaction");
+                    } else {
+                        // if the transaction is invalid, we can skip it and all of its
+                        // descendants
+                        trace!(target: "payload_builder", %error, tx=?recovered_tx.hash(), "skipping invalid transaction and its descendants");
+                    }
+                    continue
+                }
+                // this is an error that we should treat as fatal for this attempt
+                Err(err) => return Err(PayloadBuilderError::evm(err)),
+            };
 
-        // // Create the built payload - use default PayloadId since we're not using Engine API
-        // payload // service
-        // Ok(EthBuiltPayload::new(
-        //     Default::default(), // PayloadId doesn't matter for your use case
-        //     sealed_block,
-        //     total_fees,
-        //     requests,
-        // ))
+            // update and add to total fees
+            let miner_fee = recovered_tx
+                .effective_tip_per_gas(parent_header.base_fee_per_gas().unwrap_or(0))
+                .expect("fee is always valid; execution succeeded");
+            total_fees += U256::from(miner_fee) * U256::from(gas_used);
+            cumulative_gas_used += gas_used;
+            start_tx_num += 1;
+        }
     }
+
+    let BlockBuilderOutcome { execution_result, block, .. } = builder.finish(&state_provider)?;
+
+    let sealed_block = Arc::new(block.sealed_block().clone());
+    debug!(target: "payload_builder", id=%attributes.id, sealed_block_header = ?sealed_block.sealed_header(), "sealed built block");
+
+    let payload = EthBuiltPayload::new(attributes.id, sealed_block, total_fees, None);
+
+    Ok(BuildOutcome::Better { payload, cached_reads })
+
+    // Example transaction execution loop (you'll need to implement this):
+    // let mut tx_num = start_tx_num;
+    // while cumulative_gas_used < self.target_gas_limit {
+    //     let tx = provider.transaction_by_id(tx_num)?
+    //         .ok_or_eyre("Transaction not found")?;
+    //
+    //     match builder.execute_transaction(tx.clone()) {
+    //         Ok(gas_used) => {
+    //             cumulative_gas_used += gas_used;
+    //             let base_fee = builder.evm_mut().block().basefee();
+    //             let miner_fee = tx.effective_tip_per_gas(base_fee)
+    //                 .expect("fee is always valid");
+    //             total_fees += U256::from(miner_fee) * U256::from(gas_used);
+    //             tx_num += 1;
+    //         }
+    //         Err(e) => {
+    //             // Skip invalid transactions
+    //             tx_num += 1;
+    //             continue;
+    //         }
+    //     }
+    // }
+
+    // // Finish building
+    // let BlockBuilderOutcome { execution_result, block, .. } =
+    //     builder.finish(&state_provider)?;
+    // let sealed_block = Arc::new(block.sealed_block().clone());
+
+    // let requests = chain_spec
+    //     .is_prague_active_at_timestamp(next_block_attrs.timestamp)
+    //     .then_some(execution_result.requests);
+
+    // // Increment for next call
+    // self.build_from += 1;
+
+    // // Create the built payload - use default PayloadId since we're not using Engine API
+    // payload // service
+    // Ok(EthBuiltPayload::new(
+    //     Default::default(), // PayloadId doesn't matter for your use case
+    //     sealed_block,
+    //     total_fees,
+    //     requests,
+    // ))
 }
