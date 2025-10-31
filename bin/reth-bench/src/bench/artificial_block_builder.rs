@@ -23,7 +23,7 @@ use reth_provider::{
 };
 use reth_revm::{database::StateProviderDatabase, db::State};
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 
 type BenchDbProvider =
     DatabaseProvider<Tx<RO>, NodeTypesWithDBAdapter<EthereumNode, Arc<DatabaseEnv>>>;
@@ -101,6 +101,11 @@ impl ArtificialBlockBuilder {
         // Loop until you hit target_gas_limit or run out of transactions
         let mut cumulative_gas_used = 0;
         let mut total_fees = U256::ZERO;
+
+        builder.apply_pre_execution_changes().map_err(|err| {
+            warn!(target: "payload_builder", %err, "failed to apply pre-execution changes");
+            PayloadBuilderError::Internal(err.into())
+        })?;
 
         // Example transaction execution loop (you'll need to implement this):
         // let mut tx_num = start_tx_num;

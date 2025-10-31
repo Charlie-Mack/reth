@@ -246,7 +246,7 @@ impl Command {
         if self.rpc_url.is_none() {
             let datadir = self.datadir.datadir.unwrap_or_default();
             info!("Using datadir: {}", datadir);
-            let mut builder = ArtificialBlockBuilder::new(datadir, 23681700, 45_000_000)?;
+            let mut builder = ArtificialBlockBuilder::new(datadir, 23686410, 45_000_000)?;
             builder.build_next_block()?;
 
             return Ok(());
