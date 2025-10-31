@@ -2,7 +2,7 @@
 //! The file can then be used as input for replaying benchmarks from a file.
 
 use crate::bench::{
-    artificial_block_builder::ArtificialBlockBuilder,
+    artificial_payload_builder::ArtificialPayloadBuilder,
     context::{BenchContext, BlockSource},
     output::BLOCK_STORAGE_OUTPUT_SUFFIX,
 };
@@ -246,9 +246,9 @@ impl Command {
         if self.rpc_url.is_none() {
             let datadir = self.datadir.datadir.unwrap_or_default();
             info!("Using datadir: {}", datadir);
-            let mut builder = ArtificialBlockBuilder::new(datadir, 23686410, 45_000_000)?;
-            builder.build_next_block()?;
+            // let mut builder = ArtificialPayloadBuilder::new(datadir, 23686410, 45_000_000)?;
 
+            // builder.build_next_payload()?;
             return Ok(());
         }
 

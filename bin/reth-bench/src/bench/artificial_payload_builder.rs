@@ -30,33 +30,64 @@ type BenchDbProvider =
 
 type BenchProviderFactory = ProviderFactory<NodeTypesWithDBAdapter<EthereumNode, Arc<DatabaseEnv>>>;
 
-pub struct ArtificialBlockBuilder {
-    factory: BenchProviderFactory,
-    evm_config: EthEvmConfig,
-    /// The block number to start building from
-    build_from: u64,
-    /// Target gas per block (for benchmarking)
+pub struct ArtificialPayloadBuilder {
+    client: Client,
+    evm_config: EvmConfig,
     target_gas_limit: u64,
+    builder_config: EthereumBuilderConfig,
+    // Track which transaction number to start from
+    next_tx_num: u64,
 }
 
-impl ArtificialBlockBuilder {
-    /// Create a new artificial block builder from a datadir path
-    pub fn new(
-        datadir: PlatformPath<DataDirPath>,
-        build_from: u64,
-        target_gas_limit: u64,
-    ) -> eyre::Result<Self> {
-        let spec = ChainSpecBuilder::mainnet().build();
-        let factory = EthereumNode::provider_factory_builder()
-            .open_read_only(spec.into(), ReadOnlyConfig::from_datadir(datadir))?;
+impl<Client, EvmConfig> ArtificialPayloadBuilder<Client, EvmConfig> {
+    pub fn new(client: Client, evm_config: EvmConfig, builder_config: EthereumBuilderConfig, target_gas_limit: u64, from_block: u64) -> Self {
+        Self { client, evm_config, builder_config, target_gas_limit, next_tx_num: 0 }
+    }   
+}
 
-        let evm_config = EthEvmConfig::mainnet();
+impl<Client, EvmConfig> PayloadBuilder for ArtificialPayloadBuilder<Client, EvmConfig>
+where
+    EvmConfig: ConfigureEvm<Primitives = EthPrimitives, NextBlockEnvCtx = NextBlockEnvAttributes>,
+    Client: StateProviderFactory
+        + ChainSpecProvider<ChainSpec: EthereumHardforks>
+        + BlockReader
+        + TransactionsProvider
+        + HeaderProvider<Header = AlloyHeader>
+        + Clone,
+{
+    type Attributes = EthPayloadBuilderAttributes;
+    type BuiltPayload = EthBuiltPayload;
 
-        Ok(Self { factory, evm_config, build_from, target_gas_limit })
+    fn try_build(
+        &self,
+        args: BuildArguments<EthPayloadBuilderAttributes, EthBuiltPayload>,
+    ) -> Result<BuildOutcome<EthBuiltPayload>, PayloadBuilderError> {
+        let BuildArguments { mut cached_reads, config, cancel, best_payload } = args;
+        let PayloadConfig { parent_header, attributes } = config;
+
+        self.build_next_artificial_block()
     }
 
+    fn on_missing_payload(
+        &self,
+        _args: BuildArguments<Self::Attributes, Self::BuiltPayload>,
+    ) -> MissingPayloadBehaviour<Self::BuiltPayload> {
+        // For benchmarking, we don't need to race empty payloads
+        MissingPayloadBehaviour::AwaitInProgress
+    }
+
+    fn build_empty_payload(
+        &self,
+        config: PayloadConfig<Self::Attributes, HeaderForPayload<Self::BuiltPayload>>,
+    ) -> Result<Self::BuiltPayload, PayloadBuilderError> {
+        // For benchmarking, you probably don't need this
+        // But you could build a minimal block with no transactions
+        Err(PayloadBuilderError::MissingPayload)
+    }
+
+
     /// Build the next artificial block and return it as an EthBuiltPayload
-    pub fn build_next_block(&mut self) -> eyre::Result<EthBuiltPayload> {
+    fn build_next_artificial_block(&mut self) -> eyre::Result<EthBuiltPayload> {
         let parent_block_number = self.build_from;
 
         // Get a provider from the factory for this operation
