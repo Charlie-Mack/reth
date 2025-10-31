@@ -232,11 +232,6 @@ where
                 Err(err) => return Err(PayloadBuilderError::evm(err)),
             };
 
-            // update and add to total fees
-            let miner_fee = recovered_tx
-                .effective_tip_per_gas(parent_header.base_fee_per_gas().unwrap_or(0))
-                .expect("fee is always valid; execution succeeded");
-            total_fees += U256::from(miner_fee) * U256::from(gas_used);
             cumulative_gas_used += gas_used;
             start_tx_num += 1;
         }

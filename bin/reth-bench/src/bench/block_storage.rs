@@ -16,7 +16,7 @@ use alloy_rlp::{Decodable, Encodable};
 use clap::Parser;
 use eyre::{Context, OptionExt};
 use op_alloy_consensus::OpTxEnvelope;
-use reth_basic_payload_builder::PayloadBuilder;
+use reth_basic_payload_builder::{BuildOutcome, PayloadBuilder};
 use reth_chainspec::ChainSpecBuilder;
 use reth_cli_runner::CliContext;
 use reth_ethereum_payload_builder::EthereumBuilderConfig;
@@ -273,9 +273,32 @@ impl Command {
 
             let build_args = builder.get_build_args(from_block)?;
 
-            let payload = builder.try_build(build_args)?;
+            let BuildOutcome::Better { payload, .. } = builder.try_build(build_args)? else {
+                return Err(eyre::eyre!("Failed to build payload"));
+            };
 
             info!("Built new payload for block {:?}", payload);
+
+            // Initialize file writer with header
+            let output_path = self
+                .benchmark
+                .output
+                .as_ref()
+                .ok_or_eyre("--output is required")?
+                .join(BLOCK_STORAGE_OUTPUT_SUFFIX);
+
+            let to_block = from_block + 1;
+
+            let header = BlockFileHeader::new(false, from_block, to_block);
+            let mut file_writer = BlockFileWriter::new(&output_path, header)?;
+
+            let block = payload.block();
+            let mut buf = Vec::with_capacity(block.length());
+            block.encode(&mut buf);
+            file_writer.write_block(&buf)?;
+
+            let blocks_written = file_writer.finish()?;
+            info!("Successfully wrote {} blocks to file", blocks_written);
 
             // let mut builder = ArtificialPayloadBuilder::new(datadir, 23686410, 45_000_000)?;
 
