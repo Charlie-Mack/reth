@@ -2,7 +2,7 @@
 //! The file can then be used as input for replaying benchmarks from a file.
 
 use crate::bench::{
-    artificial_payload_builder::ArtificialPayloadBuilder,
+    artificial_payload_builder::{ArtificialPayloadBuilder, BenchmarkEvmConfig},
     context::{BenchContext, BlockSource},
     output::BLOCK_STORAGE_OUTPUT_SUFFIX,
 };
@@ -256,6 +256,7 @@ impl Command {
                 .open_read_only(spec.into(), ReadOnlyConfig::from_datadir(datadir))?;
 
             let evm_config = EthEvmConfig::mainnet();
+            let benchmark_evm_config = BenchmarkEvmConfig::new(evm_config);
             let builder_config = EthereumBuilderConfig::default();
 
             let provider = factory.provider()?;
@@ -265,7 +266,7 @@ impl Command {
             let from_block = 23696800;
             let mut builder = ArtificialPayloadBuilder::new(
                 factory,
-                evm_config,
+                benchmark_evm_config,
                 builder_config,
                 target_gas_limit,
                 from_block,

@@ -14,6 +14,8 @@ workspace = true
 
 [dependencies]
 # reth
+reth-trie-common.workspace = true
+revm.workspace = true
 reth-consensus-common.workspace = true
 reth-payload-primitives.workspace = true
 reth-payload-builder.workspace = true
@@ -39,6 +41,7 @@ reth-ethereum-primitives.workspace = true
 reth-tracing.workspace = true
 
 # alloy
+alloy-evm.workspace = true
 alloy-eips.workspace = true
 alloy-json-rpc.workspace = true
 alloy-consensus.workspace = true

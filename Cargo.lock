@@ -7326,6 +7326,7 @@ version = "1.8.2"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
+ "alloy-evm",
  "alloy-json-rpc",
  "alloy-primitives",
  "alloy-provider",
@@ -7369,6 +7370,8 @@ dependencies = [
  "reth-revm",
  "reth-storage-api",
  "reth-tracing",
+ "reth-trie-common",
+ "revm",
  "serde",
  "serde_json",
  "thiserror 2.0.17",

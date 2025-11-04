@@ -1,5 +1,6 @@
 use alloy_consensus::{BlockHeader, Transaction};
 use alloy_eips::{BlockNumberOrTag, Typed2718};
+use alloy_evm::{Database, EvmFactory};
 use alloy_primitives::{Address, B256, U256};
 use alloy_rlp::Encodable;
 use alloy_rpc_types_engine::PayloadAttributes;
@@ -8,6 +9,7 @@ use reth_basic_payload_builder::{
     BuildArguments, BuildOutcome, HeaderForPayload, MissingPayloadBehaviour, PayloadBuilder,
     PayloadConfig,
 };
+
 use reth_chainspec::{ChainSpecBuilder, EthChainSpec, EthereumHardforks};
 use reth_consensus_common::validation::MAX_RLP_BLOCK_SIZE;
 use reth_db::{
@@ -17,16 +19,25 @@ use reth_db::{
 use reth_ethereum_payload_builder::EthereumBuilderConfig;
 use reth_ethereum_primitives::{EthPrimitives, TransactionSigned};
 use reth_evm::{
-    block::{BlockExecutionError, BlockValidationError},
-    execute::{BlockBuilder, BlockBuilderOutcome, ExecutorTx},
-    ConfigureEvm, NextBlockEnvAttributes,
+    block::{
+        BlockExecutionError, BlockExecutor, BlockExecutorFactory, BlockExecutorFor,
+        BlockValidationError, CommitChanges,
+    },
+    execute::{
+        BasicBlockBuilder, BlockAssembler, BlockAssemblerInput, BlockBuilder, BlockBuilderOutcome,
+        Executor, ExecutorTx,
+    },
+    ConfigureEvm, Evm, EvmEnvFor, EvmFor, ExecutionCtxFor, InspectorFor, NextBlockEnvAttributes,
 };
 use reth_node_api::{NodeTypesWithDBAdapter, PayloadBuilderError};
 use reth_node_core::dirs::{DataDirPath, PlatformPath};
 use reth_node_ethereum::{EthEvmConfig, EthereumNode};
 use reth_payload_builder::{BlobSidecars, EthBuiltPayload, EthPayloadBuilderAttributes};
 use reth_payload_primitives::PayloadBuilderAttributes;
-use reth_primitives_traits::SignedTransaction;
+use reth_primitives_traits::{
+    BlockTy, HeaderTy, NodePrimitives, Recovered, RecoveredBlock, SealedBlock, SealedHeader,
+    SignedTransaction, TxTy,
+};
 use reth_provider::{
     providers::ReadOnlyConfig, BlockBodyIndicesProvider, BlockReader, ChainSpecProvider,
     DatabaseProvider, HeaderProvider, ProviderFactory, StateProviderFactory, TransactionsProvider,
@@ -34,12 +45,202 @@ use reth_provider::{
 use reth_revm::{
     cached::CachedReads, cancelled::CancelOnDrop, database::StateProviderDatabase, db::State,
 };
+use reth_storage_api::StateProvider;
+use reth_trie_common::{updates::TrieUpdates, HashedPostState};
+use revm::{context::result::ExecutionResult, database::states::bundle_state::BundleRetention};
 use std::sync::Arc;
 use tracing::{debug, info, trace, warn};
 
 type BenchDbProvider =
     DatabaseProvider<Tx<RO>, NodeTypesWithDBAdapter<EthereumNode, Arc<DatabaseEnv>>>;
 
+/// EVM config wrapper that uses benchmark block builder
+#[derive(Debug, Clone)]
+pub struct BenchmarkEvmConfig<Inner> {
+    inner: Inner,
+}
+
+impl<Inner> BenchmarkEvmConfig<Inner> {
+    pub fn new(inner: Inner) -> Self {
+        Self { inner }
+    }
+}
+
+impl<Inner: ConfigureEvm> ConfigureEvm for BenchmarkEvmConfig<Inner> {
+    type Primitives = Inner::Primitives;
+    type Error = Inner::Error;
+    type NextBlockEnvCtx = Inner::NextBlockEnvCtx;
+    type BlockExecutorFactory = Inner::BlockExecutorFactory;
+    type BlockAssembler = Inner::BlockAssembler;
+
+    // Only implement required methods + the one we customize
+    fn block_executor_factory(&self) -> &Self::BlockExecutorFactory {
+        self.inner.block_executor_factory()
+    }
+
+    fn block_assembler(&self) -> &Self::BlockAssembler {
+        self.inner.block_assembler()
+    }
+
+    fn evm_env(&self, header: &HeaderTy<Self::Primitives>) -> Result<EvmEnvFor<Self>, Self::Error> {
+        self.inner.evm_env(header)
+    }
+
+    fn next_evm_env(
+        &self,
+        parent: &HeaderTy<Self::Primitives>,
+        attributes: &Self::NextBlockEnvCtx,
+    ) -> Result<EvmEnvFor<Self>, Self::Error> {
+        self.inner.next_evm_env(parent, attributes)
+    }
+
+    fn context_for_block<'a>(
+        &self,
+        block: &'a SealedBlock<BlockTy<Self::Primitives>>,
+    ) -> Result<ExecutionCtxFor<'a, Self>, Self::Error> {
+        self.inner.context_for_block(block)
+    }
+
+    fn context_for_next_block(
+        &self,
+        parent: &SealedHeader<HeaderTy<Self::Primitives>>,
+        attributes: Self::NextBlockEnvCtx,
+    ) -> Result<ExecutionCtxFor<'_, Self>, Self::Error> {
+        self.inner.context_for_next_block(parent, attributes)
+    }
+
+    // The key override
+    fn create_block_builder<'a, DB, I>(
+        &'a self,
+        evm: EvmFor<Self, &'a mut State<DB>, I>,
+        parent: &'a SealedHeader<HeaderTy<Self::Primitives>>,
+        ctx: <Self::BlockExecutorFactory as BlockExecutorFactory>::ExecutionCtx<'a>,
+    ) -> impl BlockBuilder<
+        Primitives = Self::Primitives,
+        Executor: BlockExecutorFor<'a, Self::BlockExecutorFactory, DB, I>,
+    >
+    where
+        DB: Database,
+        I: InspectorFor<Self, &'a mut State<DB>> + 'a,
+    {
+        BenchmarkBlockBuilder {
+            executor: self.create_executor(evm, ctx.clone()),
+            ctx,
+            assembler: self.block_assembler(),
+            parent,
+            transactions: Vec::new(),
+        }
+    }
+}
+
+/// Block builder that skips state root calculation for benchmarking
+#[derive(Debug)]
+pub struct BenchmarkBlockBuilder<'a, F, Executor, Builder, N>
+where
+    F: BlockExecutorFactory,
+    N: NodePrimitives,
+{
+    /// The block executor used to execute transactions.
+    pub executor: Executor,
+    /// The transactions executed in this block.
+    pub transactions: Vec<Recovered<TxTy<N>>>,
+    /// The parent block execution context.
+    pub ctx: F::ExecutionCtx<'a>,
+    /// The sealed parent block header.
+    pub parent: &'a SealedHeader<HeaderTy<N>>,
+    /// The assembler used to build the block.
+    pub assembler: Builder,
+}
+
+impl<'a, F, DB, Executor, Builder, N> BlockBuilder
+    for BenchmarkBlockBuilder<'a, F, Executor, Builder, N>
+where
+    F: BlockExecutorFactory<Transaction = N::SignedTx, Receipt = N::Receipt>,
+    Executor: BlockExecutor<
+        Evm: Evm<
+            Spec = <F::EvmFactory as EvmFactory>::Spec,
+            HaltReason = <F::EvmFactory as EvmFactory>::HaltReason,
+            BlockEnv = <F::EvmFactory as EvmFactory>::BlockEnv,
+            DB = &'a mut State<DB>,
+        >,
+        Transaction = N::SignedTx,
+        Receipt = N::Receipt,
+    >,
+    DB: Database + 'a,
+    Builder: BlockAssembler<F, Block = N::Block>,
+    N: NodePrimitives,
+{
+    type Primitives = N;
+    type Executor = Executor;
+
+    fn apply_pre_execution_changes(&mut self) -> Result<(), BlockExecutionError> {
+        self.executor.apply_pre_execution_changes()
+    }
+
+    fn execute_transaction_with_commit_condition(
+        &mut self,
+        tx: impl ExecutorTx<Self::Executor>,
+        f: impl FnOnce(
+            &ExecutionResult<<<Self::Executor as BlockExecutor>::Evm as Evm>::HaltReason>,
+        ) -> CommitChanges,
+    ) -> Result<Option<u64>, BlockExecutionError> {
+        if let Some(gas_used) =
+            self.executor.execute_transaction_with_commit_condition(tx.as_executable(), f)?
+        {
+            self.transactions.push(tx.into_recovered());
+            Ok(Some(gas_used))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn finish(
+        self,
+        state: impl StateProvider,
+    ) -> Result<BlockBuilderOutcome<N>, BlockExecutionError> {
+        let (evm, result) = self.executor.finish()?;
+        let (db, evm_env) = evm.finish();
+
+        // merge all transitions into bundle state
+        db.merge_transitions(BundleRetention::Reverts);
+
+        // Skip expensive state root calculation - use dummy value
+        info!(target: "benchmark", "Skipping state root calculation for benchmark block");
+        let state_root = B256::ZERO;
+        let hashed_state = HashedPostState::default();
+        let trie_updates = TrieUpdates::default();
+
+        let (transactions, senders) =
+            self.transactions.into_iter().map(|tx| tx.into_parts()).unzip();
+
+        let block = self.assembler.assemble_block(BlockAssemblerInput::new(
+            evm_env,
+            self.ctx,
+            self.parent,
+            transactions,
+            &result,
+            &db.bundle_state,
+            &state,
+            state_root,
+        ))?;
+
+        let block = RecoveredBlock::new_unhashed(block, senders);
+
+        Ok(BlockBuilderOutcome { execution_result: result, hashed_state, trie_updates, block })
+    }
+
+    fn executor_mut(&mut self) -> &mut Self::Executor {
+        &mut self.executor
+    }
+
+    fn executor(&self) -> &Self::Executor {
+        &self.executor
+    }
+
+    fn into_executor(self) -> Self::Executor {
+        self.executor
+    }
+}
 #[derive(Debug, Clone)]
 pub struct ArtificialPayloadBuilder<EvmConfig = EthEvmConfig> {
     factory: ProviderFactory<NodeTypesWithDBAdapter<EthereumNode, Arc<DatabaseEnv>>>,
@@ -240,53 +441,10 @@ where
     let BlockBuilderOutcome { execution_result, block, .. } = builder.finish(&state_provider)?;
 
     let sealed_block = Arc::new(block.sealed_block().clone());
-    debug!(target: "payload_builder", id=%attributes.id, sealed_block_header = ?sealed_block.sealed_header(), "sealed built block");
+    debug!(target: "payload_builder", id=%attributes.id, sealed_block_header =
+    ?sealed_block.sealed_header(), "sealed built block");
 
     let payload = EthBuiltPayload::new(attributes.id, sealed_block, total_fees, None);
 
     Ok(BuildOutcome::Better { payload, cached_reads })
-
-    // Example transaction execution loop (you'll need to implement this):
-    // let mut tx_num = start_tx_num;
-    // while cumulative_gas_used < self.target_gas_limit {
-    //     let tx = provider.transaction_by_id(tx_num)?
-    //         .ok_or_eyre("Transaction not found")?;
-    //
-    //     match builder.execute_transaction(tx.clone()) {
-    //         Ok(gas_used) => {
-    //             cumulative_gas_used += gas_used;
-    //             let base_fee = builder.evm_mut().block().basefee();
-    //             let miner_fee = tx.effective_tip_per_gas(base_fee)
-    //                 .expect("fee is always valid");
-    //             total_fees += U256::from(miner_fee) * U256::from(gas_used);
-    //             tx_num += 1;
-    //         }
-    //         Err(e) => {
-    //             // Skip invalid transactions
-    //             tx_num += 1;
-    //             continue;
-    //         }
-    //     }
-    // }
-
-    // // Finish building
-    // let BlockBuilderOutcome { execution_result, block, .. } =
-    //     builder.finish(&state_provider)?;
-    // let sealed_block = Arc::new(block.sealed_block().clone());
-
-    // let requests = chain_spec
-    //     .is_prague_active_at_timestamp(next_block_attrs.timestamp)
-    //     .then_some(execution_result.requests);
-
-    // // Increment for next call
-    // self.build_from += 1;
-
-    // // Create the built payload - use default PayloadId since we're not using Engine API
-    // payload // service
-    // Ok(EthBuiltPayload::new(
-    //     Default::default(), // PayloadId doesn't matter for your use case
-    //     sealed_block,
-    //     total_fees,
-    //     requests,
-    // ))
 }
